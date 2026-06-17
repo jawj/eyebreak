@@ -1,0 +1,49 @@
+# Build products
+build/
+DerivedData/
+*.app
+*.o
+*.d
+*.dSYM/
+*.xcarchive
+
+# Xcode user data
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+*.moved-aside
+*.pbxuser
+!default.pbxuser
+*.mode1v3
+!default.mode1v3
+*.mode2v3
+!default.mode2v3
+*.perspectivev3
+!default.perspectivev3
+
+# Xcode workspace / SwiftPM
+*.xcworkspace
+!default.xcworkspace
+.swiftpm/
+Packages/
+Package.resolved
+
+# CocoaPods
+Pods/
+
+# Carthage
+Carthage/Build/
+
+# Swift Package Manager build dir
+.build/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+
+# Misc
+*.hmap
+*.ipa
+*.log
