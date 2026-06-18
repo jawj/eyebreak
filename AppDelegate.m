@@ -2,24 +2,37 @@
 #import "BreakOverlayController.h"
 #import <CoreGraphics/CoreGraphics.h>
 #import <ServiceManagement/ServiceManagement.h>
+#import <math.h>
+#import <time.h>
 
 // Tunables.
 static const NSInteger kWorkInterval       = 20 * 60; // 20 minutes of work
 static const NSInteger kBreakDuration      = 20;      // 20 second break
 static const NSInteger kIdleResetThreshold = 5 * 60;  // reset if idle >= 5 minutes
+static NSString *const kBreakSoundName      = @"Glass"; // gentle chime from /System/Library/Sounds
+
+// Monotonic clock that does NOT advance while the machine is asleep — the work
+// interval should only count real on-screen time, not time with the lid shut.
+// The 1s timer is just a UI refresh; accuracy comes from comparing against this.
+static uint64_t EBNowNanos(void) {
+    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+}
 
 typedef NS_ENUM(NSInteger, EBState) {
     EBStateWorking,
     EBStateOnBreak,
 };
 
-@interface AppDelegate ()
+@interface AppDelegate () <NSMenuDelegate>
 @property (nonatomic, strong) NSStatusItem *statusItem;
 @property (nonatomic, strong) NSTimer *timer;
 @property (nonatomic, strong) BreakOverlayController *overlay;
-@property (nonatomic, assign) NSInteger secondsRemaining;
+@property (nonatomic, assign) NSInteger secondsRemaining; // break countdown only
+@property (nonatomic, assign) uint64_t workDeadline;      // EBNowNanos() of next break
+@property (nonatomic, assign) uint64_t pauseStartedAt;    // EBNowNanos() when paused
 @property (nonatomic, assign) EBState state;
 @property (nonatomic, assign) BOOL paused;
+@property (nonatomic, strong) NSMenuItem *countdownItem;
 @property (nonatomic, strong) NSMenuItem *pauseItem;
 @property (nonatomic, strong) NSMenuItem *launchAtLoginItem;
 @end
@@ -27,7 +40,7 @@ typedef NS_ENUM(NSInteger, EBState) {
 @implementation AppDelegate
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
-    self.overlay = [[BreakOverlayController alloc] init];
+    self.overlay = BreakOverlayController.new;
 
     __weak typeof(self) weakSelf = self;
     self.overlay.onSkip = ^{
@@ -37,28 +50,33 @@ typedef NS_ENUM(NSInteger, EBState) {
     [self setupStatusItem];
 
     self.state = EBStateWorking;
-    self.secondsRemaining = kWorkInterval;
-    [self updateStatusTitle];
+    [self beginWorkInterval];
 
-    // One tick per second drives the whole app.
+    // one tick per second drives the whole app
     self.timer = [NSTimer scheduledTimerWithTimeInterval:1.0
                                                   target:self
                                                 selector:@selector(tick)
                                                 userInfo:nil
                                                  repeats:YES];
 
-    // Keep ticking smoothly even while menus are open.
+    // keep ticking smoothly even while menus are open
     [[NSRunLoop currentRunLoop] addTimer:self.timer forMode:NSRunLoopCommonModes];
 }
 
 - (void)setupStatusItem {
     self.statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
-    self.statusItem.button.font = [NSFont monospacedDigitSystemFontOfSize:13.0
-                                                                   weight:NSFontWeightRegular];
+    self.statusItem.button.title = @"\U0001F441";
 
-    NSMenu *menu = [[NSMenu alloc] init];
+    NSMenu *menu = NSMenu.new;
+    menu.delegate = self;
 
-    [menu addItemWithTitle:@"Take a break now"
+    // Non-clickable header showing time until the next break. Refreshed by
+    // menuNeedsUpdate: before opening and by tick while it stays open.
+    self.countdownItem = [menu addItemWithTitle:@"" action:NULL keyEquivalent:@""];
+    self.countdownItem.enabled = NO;
+    [menu addItem:NSMenuItem.separatorItem];
+
+    [menu addItemWithTitle:@"Look away now"
                     action:@selector(takeBreakNow:)
              keyEquivalent:@""].target = self;
 
@@ -66,14 +84,14 @@ typedef NS_ENUM(NSInteger, EBState) {
                     action:@selector(resetTimer:)
              keyEquivalent:@""].target = self;
 
-    [menu addItem:[NSMenuItem separatorItem]];
+    [menu addItem:NSMenuItem.separatorItem];
 
     self.pauseItem = [menu addItemWithTitle:@"Pause"
                                      action:@selector(togglePause:)
                               keyEquivalent:@""];
     self.pauseItem.target = self;
 
-    self.launchAtLoginItem = [menu addItemWithTitle:@"Launch at Login"
+    self.launchAtLoginItem = [menu addItemWithTitle:@"Launch at login"
                                              action:@selector(toggleLaunchAtLogin:)
                                       keyEquivalent:@""];
     self.launchAtLoginItem.target = self;
@@ -81,19 +99,50 @@ typedef NS_ENUM(NSInteger, EBState) {
 
     [menu addItem:[NSMenuItem separatorItem]];
 
-    [menu addItemWithTitle:@"Quit Eye Break"
+    [menu addItemWithTitle:@"Quit EyeBreak"
                     action:@selector(quit:)
              keyEquivalent:@"q"].target = self;
 
     self.statusItem.menu = menu;
 }
 
+#pragma mark - Work interval
+
+// Anchor the next break to a wall-position on the monotonic uptime clock, so the
+// countdown stays accurate even if ticks are late, dropped, or coalesced.
+- (void)beginWorkInterval {
+    self.workDeadline = EBNowNanos() + (uint64_t)kWorkInterval * NSEC_PER_SEC;
+}
+
+- (NSInteger)workSecondsRemaining {
+    uint64_t now = EBNowNanos();
+    if (now >= self.workDeadline) return 0;
+    return (NSInteger)ceil((double)(self.workDeadline - now) / (double)NSEC_PER_SEC);
+}
+
+#pragma mark - Menu countdown
+
+- (NSString *)countdownText {
+    if (self.paused) return @"Paused";
+    if (self.state == EBStateOnBreak) return @"Looking away";
+    NSInteger total = [self workSecondsRemaining];
+    return [NSString stringWithFormat:@"Look away in %ld:%02ld",
+            (long)(total / 60), (long)(total % 60)];
+}
+
+- (void)refreshCountdownItem {
+    self.countdownItem.title = [self countdownText];
+}
+
+- (void)menuNeedsUpdate:(NSMenu *)menu {
+    [self refreshCountdownItem];
+}
+
 #pragma mark - Timer loop
 
 - (void)tick {
-    if (self.paused) {
-        return;
-    }
+    [self refreshCountdownItem]; // keep the header live while the menu is open
+    if (self.paused) return;
 
     if (self.state == EBStateWorking) {
         // Optional frill: if the user has been idle for a while, keep the
@@ -101,17 +150,15 @@ typedef NS_ENUM(NSInteger, EBState) {
         CFTimeInterval idle = CGEventSourceSecondsSinceLastEventType(kCGEventSourceStateHIDSystemState,
                                                                      kCGAnyInputEventType);
         if (idle >= kIdleResetThreshold) {
-            self.secondsRemaining = kWorkInterval;
-            [self updateStatusTitle];
+            [self beginWorkInterval];
             return;
         }
 
-        self.secondsRemaining -= 1;
-        if (self.secondsRemaining <= 0) {
+        if ([self workSecondsRemaining] <= 0) {
             [self startBreak];
             return;
         }
-        [self updateStatusTitle];
+
     } else { // EBStateOnBreak
         // The break only "counts" while you're actually away from the keyboard
         // and mouse (i.e. genuinely looking into the distance). Any input
@@ -137,7 +184,8 @@ typedef NS_ENUM(NSInteger, EBState) {
 - (void)startBreak {
     self.state = EBStateOnBreak;
     self.secondsRemaining = kBreakDuration;
-    [self updateStatusTitle];
+
+    [[NSSound soundNamed:kBreakSoundName] play];
 
     // Deliberately do NOT activate/steal focus — the small overlay just floats
     // on top so it won't interrupt a call or whatever you're doing.
@@ -148,8 +196,7 @@ typedef NS_ENUM(NSInteger, EBState) {
 - (void)endBreak {
     [self.overlay hide];
     self.state = EBStateWorking;
-    self.secondsRemaining = kWorkInterval;
-    [self updateStatusTitle];
+    [self beginWorkInterval];
 }
 
 #pragma mark - Menu actions
@@ -164,29 +211,32 @@ typedef NS_ENUM(NSInteger, EBState) {
     if (self.state == EBStateOnBreak) {
         [self endBreak];
     } else {
-        self.secondsRemaining = kWorkInterval;
-        [self updateStatusTitle];
+        [self beginWorkInterval];
     }
 }
 
 - (void)togglePause:(id)sender {
     self.paused = !self.paused;
+    if (self.paused) {
+        // Freeze: remember when we paused so we can push the deadline forward by
+        // the paused duration on resume (real time keeps passing while paused).
+        self.pauseStartedAt = EBNowNanos();
+    } else {
+        self.workDeadline += EBNowNanos() - self.pauseStartedAt;
+    }
     self.pauseItem.title = self.paused ? @"Resume" : @"Pause";
-    [self updateStatusTitle];
 }
 
 - (void)toggleLaunchAtLogin:(id)sender {
     SMAppService *service = [SMAppService mainAppService];
     NSError *error = nil;
     BOOL ok;
-    if (service.status == SMAppServiceStatusEnabled) {
-        ok = [service unregisterAndReturnError:&error];
-    } else {
-        ok = [service registerAndReturnError:&error];
-    }
+    if (service.status == SMAppServiceStatusEnabled) ok = [service unregisterAndReturnError:&error];
+    else ok = [service registerAndReturnError:&error];
+
     if (!ok) {
         NSAlert *alert = [[NSAlert alloc] init];
-        alert.messageText = @"Couldn't change Launch at Login";
+        alert.messageText = @"Couldn't change launch at login status";
         alert.informativeText = error.localizedDescription ?: @"Unknown error.";
         [alert runModal];
     }
@@ -200,22 +250,6 @@ typedef NS_ENUM(NSInteger, EBState) {
 
 - (void)quit:(id)sender {
     [NSApp terminate:nil];
-}
-
-#pragma mark - Status bar title
-
-- (void)updateStatusTitle {
-    NSString *title;
-    if (self.paused) {
-        title = @"\U0001F441 --:--"; // pause glyph
-    } else if (self.state == EBStateOnBreak) {
-        title = @"\U0001F441 Look away";
-    } else {
-        NSInteger total = MAX(self.secondsRemaining, 0);
-        title = [NSString stringWithFormat:@"\U0001F441 %ld:%02ld",
-                 (long)(total / 60), (long)(total % 60)];
-    }
-    self.statusItem.button.title = title;
 }
 
 @end

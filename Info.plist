@@ -3,9 +3,9 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>Eye Break</string>
+    <string>EyeBreak</string>
     <key>CFBundleDisplayName</key>
-    <string>Eye Break</string>
+    <string>EyeBreak</string>
     <key>CFBundleIdentifier</key>
     <string>com.eyebreak.app</string>
     <key>CFBundleVersion</key>
@@ -21,6 +21,6 @@
     <key>LSUIElement</key>
     <true/>
     <key>NSHumanReadableCopyright</key>
-    <string>Eye Break</string>
+    <string>EyeBreak</string>
 </dict>
 </plist>

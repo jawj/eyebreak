@@ -5,11 +5,11 @@ int main(int argc, const char *argv[]) {
     (void)argc;
     (void)argv;
     @autoreleasepool {
-        NSApplication *app = [NSApplication sharedApplication];
-        AppDelegate *delegate = [[AppDelegate alloc] init];
+        NSApplication *app = NSApplication.sharedApplication;
+        AppDelegate *delegate = AppDelegate.new;
         app.delegate = delegate;
 
-        // Accessory: lives in the menu bar, no Dock icon, no main window.
+        // accessory: lives in the menu bar, no Dock icon, no main window
         [app setActivationPolicy:NSApplicationActivationPolicyAccessory];
         [app run];
     }
