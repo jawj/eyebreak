@@ -8,8 +8,10 @@
 // Tunables.
 static const NSInteger kWorkInterval       = 20 * 60; // 20 minutes of work
 static const NSInteger kBreakDuration      = 20;      // 20 second break
-static const NSInteger kIdleResetThreshold = 5 * 60;  // reset if idle >= 5 minutes
-static NSString *const kBreakSoundName      = @"Glass"; // gentle chime from /System/Library/Sounds
+static const NSInteger kIdleResetThreshold = 3 * 60;  // reset if idle >= 3 minutes
+static NSString *const kBreakSoundName      = @"Blow"; // gentle chime when a break starts
+static NSString *const kBreakEndSoundName   = @"Submarine";  // gentle chime when a break completes
+static NSString *const kSilentDefaultsKey   = @"Silent"; // NSUserDefaults: suppress all sounds
 
 // Monotonic clock that does NOT advance while the machine is asleep — the work
 // interval should only count real on-screen time, not time with the lid shut.
@@ -32,8 +34,10 @@ typedef NS_ENUM(NSInteger, EBState) {
 @property (nonatomic, assign) uint64_t pauseStartedAt;    // EBNowNanos() when paused
 @property (nonatomic, assign) EBState state;
 @property (nonatomic, assign) BOOL paused;
+@property (nonatomic, assign) BOOL silent;
 @property (nonatomic, strong) NSMenuItem *countdownItem;
 @property (nonatomic, strong) NSMenuItem *pauseItem;
+@property (nonatomic, strong) NSMenuItem *silentItem;
 @property (nonatomic, strong) NSMenuItem *launchAtLoginItem;
 @end
 
@@ -84,12 +88,19 @@ typedef NS_ENUM(NSInteger, EBState) {
                     action:@selector(resetTimer:)
              keyEquivalent:@""].target = self;
 
-    [menu addItem:NSMenuItem.separatorItem];
-
     self.pauseItem = [menu addItemWithTitle:@"Pause"
                                      action:@selector(togglePause:)
                               keyEquivalent:@""];
     self.pauseItem.target = self;
+
+    [menu addItem:NSMenuItem.separatorItem];
+
+    self.silentItem = [menu addItemWithTitle:@"Silent"
+                                      action:@selector(toggleSilent:)
+                               keyEquivalent:@""];
+    self.silentItem.target = self;
+    self.silent = [NSUserDefaults.standardUserDefaults boolForKey:kSilentDefaultsKey];
+    self.silentItem.state = self.silent ? NSControlStateValueOn : NSControlStateValueOff;
 
     self.launchAtLoginItem = [menu addItemWithTitle:@"Launch at login"
                                              action:@selector(toggleLaunchAtLogin:)
@@ -174,6 +185,8 @@ typedef NS_ENUM(NSInteger, EBState) {
         self.secondsRemaining -= 1;
         [self.overlay updateSecondsRemaining:self.secondsRemaining];
         if (self.secondsRemaining <= 0) {
+            // Chime only on a genuinely completed break — skip/reset stay silent.
+            [self playSound:kBreakEndSoundName];
             [self endBreak];
         }
     }
@@ -181,11 +194,16 @@ typedef NS_ENUM(NSInteger, EBState) {
 
 #pragma mark - Break lifecycle
 
+- (void)playSound:(NSString *)name {
+    if (self.silent) return;
+    [[NSSound soundNamed:name] play];
+}
+
 - (void)startBreak {
     self.state = EBStateOnBreak;
     self.secondsRemaining = kBreakDuration;
 
-    [[NSSound soundNamed:kBreakSoundName] play];
+    [self playSound:kBreakSoundName];
 
     // Deliberately do NOT activate/steal focus — the small overlay just floats
     // on top so it won't interrupt a call or whatever you're doing.
@@ -225,6 +243,12 @@ typedef NS_ENUM(NSInteger, EBState) {
         self.workDeadline += EBNowNanos() - self.pauseStartedAt;
     }
     self.pauseItem.title = self.paused ? @"Resume" : @"Pause";
+}
+
+- (void)toggleSilent:(id)sender {
+    self.silent = !self.silent;
+    [NSUserDefaults.standardUserDefaults setBool:self.silent forKey:kSilentDefaultsKey];
+    self.silentItem.state = self.silent ? NSControlStateValueOn : NSControlStateValueOff;
 }
 
 - (void)toggleLaunchAtLogin:(id)sender {
