@@ -51,7 +51,6 @@ static const CGFloat kTopMargin    = 24.0;
     label.textColor = [NSColor whiteColor];
     label.font = [NSFont systemFontOfSize:14.0 weight:NSFontWeightMedium];
     label.cell.usesSingleLineMode = YES;
-    label.stringValue = @"Look into the distance";
     self.label = label;
     [content addSubview:label];
 
@@ -87,24 +86,18 @@ static const CGFloat kTopMargin    = 24.0;
 }
 
 - (void)show {
-    if (!self.panel) {
-        [self buildPanel];
-    }
+    if (!self.panel) [self buildPanel];
     [self positionPanel];
     [self.panel orderFrontRegardless];
 }
 
 - (void)skipPressed:(id)sender {
-    if (self.onSkip) {
-        self.onSkip();
-    }
+    if (self.onSkip) self.onSkip();
 }
 
 - (void)updateSecondsRemaining:(NSInteger)seconds {
-    if (seconds < 0) {
-        seconds = 0;
-    }
-    self.label.stringValue = [NSString stringWithFormat:@"Look into the distance: %lds remaining",
+    if (seconds < 0) seconds = 0;
+    self.label.stringValue = [NSString stringWithFormat:@"\U0001F441 Look into the distance: %lds remaining",
                               (long)seconds];
 }
 

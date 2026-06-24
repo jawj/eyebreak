@@ -68,7 +68,7 @@ typedef NS_ENUM(NSInteger, EBState) {
 }
 
 - (void)setupStatusItem {
-    self.statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
+    self.statusItem = [NSStatusBar.systemStatusBar statusItemWithLength:NSSquareStatusItemLength];
     self.statusItem.button.title = @"\U0001F441";
 
     NSMenu *menu = NSMenu.new;
