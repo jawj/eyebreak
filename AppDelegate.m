@@ -1,6 +1,7 @@
 #import "AppDelegate.h"
 #import "BreakOverlayController.h"
 #import <CoreGraphics/CoreGraphics.h>
+#import <CoreMediaIO/CMIOHardware.h>
 #import <ServiceManagement/ServiceManagement.h>
 #import <math.h>
 #import <time.h>
@@ -9,9 +10,52 @@
 static const NSInteger kWorkInterval       = 20 * 60; // 20 minutes of work
 static const NSInteger kBreakDuration      = 20;      // 20 second break
 static const NSInteger kIdleResetThreshold = 3 * 60;  // reset if idle >= 3 minutes
+static const NSInteger kPostCallGrace      = 2 * 60;  // wait this long after a call before breaking
 static NSString *const kBreakSoundName      = @"Blow"; // gentle chime when a break starts
 static NSString *const kBreakEndSoundName   = @"Submarine";  // gentle chime when a break completes
 static NSString *const kSilentDefaultsKey   = @"Silent"; // NSUserDefaults: suppress all sounds
+static NSString *const kPostponeDefaultsKey = @"PostponeForWebcam"; // NSUserDefaults: defer breaks during calls
+
+// YES if any camera is currently capturing in any process. We only read the
+// system-wide "is running somewhere" flag CoreMediaIO already maintains, so this
+// needs no camera permission, shows no green indicator, and is app-agnostic
+// (Zoom, Teams, browser Meet, FaceTime all light up the same flag).
+static BOOL EBCameraInUse(void) {
+    CMIOObjectPropertyAddress devicesAddr = {
+        kCMIOHardwarePropertyDevices,
+        kCMIOObjectPropertyScopeGlobal,
+        kCMIOObjectPropertyElementMain
+    };
+    UInt32 dataSize = 0;
+    if (CMIOObjectGetPropertyDataSize(kCMIOObjectSystemObject, &devicesAddr, 0, NULL, &dataSize)
+            != kCMIOHardwareNoError || dataSize == 0) {
+        return NO;
+    }
+
+    UInt32 count = dataSize / sizeof(CMIOObjectID);
+    CMIOObjectID *devices = malloc(dataSize);
+    if (!devices) return NO;
+
+    BOOL inUse = NO;
+    if (CMIOObjectGetPropertyData(kCMIOObjectSystemObject, &devicesAddr, 0, NULL,
+                                  dataSize, &dataSize, devices) == kCMIOHardwareNoError) {
+        CMIOObjectPropertyAddress runningAddr = {
+            kCMIODevicePropertyDeviceIsRunningSomewhere,
+            kCMIOObjectPropertyScopeWildcard,
+            kCMIOObjectPropertyElementWildcard
+        };
+        for (UInt32 i = 0; i < count; i++) {
+            UInt32 running = 0, sz = sizeof(running);
+            if (CMIOObjectGetPropertyData(devices[i], &runningAddr, 0, NULL,
+                                          sz, &sz, &running) == kCMIOHardwareNoError && running) {
+                inUse = YES;
+                break;
+            }
+        }
+    }
+    free(devices);
+    return inUse;
+}
 
 // Monotonic clock that does NOT advance while the machine is asleep — the work
 // interval should only count real on-screen time, not time with the lid shut.
@@ -32,12 +76,16 @@ typedef NS_ENUM(NSInteger, EBState) {
 @property (nonatomic, assign) NSInteger secondsRemaining; // break countdown only
 @property (nonatomic, assign) uint64_t workDeadline;      // EBNowNanos() of next break
 @property (nonatomic, assign) uint64_t pauseStartedAt;    // EBNowNanos() when paused
+@property (nonatomic, assign) uint64_t cameraFreeSince;   // EBNowNanos() a call last ended (0 = none/on call)
 @property (nonatomic, assign) EBState state;
 @property (nonatomic, assign) BOOL paused;
 @property (nonatomic, assign) BOOL silent;
+@property (nonatomic, assign) BOOL postponeForWebcam;
+@property (nonatomic, assign) BOOL cameraWasInUse;        // previous tick's camera state
 @property (nonatomic, strong) NSMenuItem *countdownItem;
 @property (nonatomic, strong) NSMenuItem *pauseItem;
 @property (nonatomic, strong) NSMenuItem *silentItem;
+@property (nonatomic, strong) NSMenuItem *postponeItem;
 @property (nonatomic, strong) NSMenuItem *launchAtLoginItem;
 @end
 
@@ -102,6 +150,13 @@ typedef NS_ENUM(NSInteger, EBState) {
     self.silent = [NSUserDefaults.standardUserDefaults boolForKey:kSilentDefaultsKey];
     self.silentItem.state = self.silent ? NSControlStateValueOn : NSControlStateValueOff;
 
+    self.postponeItem = [menu addItemWithTitle:@"Postpone for webcam"
+                                        action:@selector(togglePostpone:)
+                                 keyEquivalent:@""];
+    self.postponeItem.target = self;
+    self.postponeForWebcam = [NSUserDefaults.standardUserDefaults boolForKey:kPostponeDefaultsKey];
+    self.postponeItem.state = self.postponeForWebcam ? NSControlStateValueOn : NSControlStateValueOff;
+
     self.launchAtLoginItem = [menu addItemWithTitle:@"Launch at login"
                                              action:@selector(toggleLaunchAtLogin:)
                                       keyEquivalent:@""];
@@ -125,9 +180,13 @@ typedef NS_ENUM(NSInteger, EBState) {
     self.workDeadline = EBNowNanos() + (uint64_t)kWorkInterval * NSEC_PER_SEC;
 }
 
+// Signed: goes negative once the deadline has passed but a break has been held
+// off (e.g. while you're on a call), so the menu can show how overdue you are.
 - (NSInteger)workSecondsRemaining {
     uint64_t now = EBNowNanos();
-    if (now >= self.workDeadline) return 0;
+    if (now >= self.workDeadline) {
+        return -(NSInteger)((now - self.workDeadline) / NSEC_PER_SEC);
+    }
     return (NSInteger)ceil((double)(self.workDeadline - now) / (double)NSEC_PER_SEC);
 }
 
@@ -137,8 +196,10 @@ typedef NS_ENUM(NSInteger, EBState) {
     if (self.paused) return @"Paused";
     if (self.state == EBStateOnBreak) return @"Looking away";
     NSInteger total = [self workSecondsRemaining];
-    return [NSString stringWithFormat:@"Look away in %ld:%02ld",
-            (long)(total / 60), (long)(total % 60)];
+    NSString *sign = total < 0 ? @"-" : @"";
+    NSInteger mag = labs(total);
+    return [NSString stringWithFormat:@"Look away in %@%ld:%02ld",
+            sign, (long)(mag / 60), (long)(mag % 60)];
 }
 
 - (void)refreshCountdownItem {
@@ -156,16 +217,40 @@ typedef NS_ENUM(NSInteger, EBState) {
     if (self.paused) return;
 
     if (self.state == EBStateWorking) {
+        // Track the camera so we can hold breaks during (and just after) calls.
+        BOOL cameraOn = NO;
+        if (self.postponeForWebcam) {
+            cameraOn = EBCameraInUse();
+            if (cameraOn) {
+                self.cameraFreeSince = 0;             // on a call right now
+            } else if (self.cameraWasInUse) {
+                self.cameraFreeSince = EBNowNanos();  // a call just ended
+            }
+            self.cameraWasInUse = cameraOn;
+        }
+
         // Optional frill: if the user has been idle for a while, keep the
         // timer pinned at full so they get a fresh 20 minutes when they return.
-        CFTimeInterval idle = CGEventSourceSecondsSinceLastEventType(kCGEventSourceStateHIDSystemState,
-                                                                     kCGAnyInputEventType);
-        if (idle >= kIdleResetThreshold) {
-            [self beginWorkInterval];
-            return;
+        // Skipped while on a call — you're present even if you aren't typing,
+        // and the deadline should keep counting down (and go overdue).
+        if (!cameraOn) {
+            CFTimeInterval idle = CGEventSourceSecondsSinceLastEventType(kCGEventSourceStateHIDSystemState,
+                                                                         kCGAnyInputEventType);
+            if (idle >= kIdleResetThreshold) {
+                [self beginWorkInterval];
+                self.cameraFreeSince = 0;
+                return;
+            }
         }
 
         if ([self workSecondsRemaining] <= 0) {
+            // A break is due — but don't interrupt a call, nor pounce the
+            // instant it ends. Wait out a short grace period after hang-up.
+            if (cameraOn) return;
+            if (self.cameraFreeSince != 0 &&
+                EBNowNanos() - self.cameraFreeSince < (uint64_t)kPostCallGrace * NSEC_PER_SEC) {
+                return;
+            }
             [self startBreak];
             return;
         }
@@ -202,6 +287,7 @@ typedef NS_ENUM(NSInteger, EBState) {
 - (void)startBreak {
     self.state = EBStateOnBreak;
     self.secondsRemaining = kBreakDuration;
+    self.cameraFreeSince = 0;
 
     [self playSound:kBreakSoundName];
 
@@ -249,6 +335,16 @@ typedef NS_ENUM(NSInteger, EBState) {
     self.silent = !self.silent;
     [NSUserDefaults.standardUserDefaults setBool:self.silent forKey:kSilentDefaultsKey];
     self.silentItem.state = self.silent ? NSControlStateValueOn : NSControlStateValueOff;
+}
+
+- (void)togglePostpone:(id)sender {
+    self.postponeForWebcam = !self.postponeForWebcam;
+    [NSUserDefaults.standardUserDefaults setBool:self.postponeForWebcam forKey:kPostponeDefaultsKey];
+    self.postponeItem.state = self.postponeForWebcam ? NSControlStateValueOn : NSControlStateValueOff;
+    if (!self.postponeForWebcam) {
+        self.cameraWasInUse = NO;
+        self.cameraFreeSince = 0;
+    }
 }
 
 - (void)toggleLaunchAtLogin:(id)sender {
