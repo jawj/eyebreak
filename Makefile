@@ -8,7 +8,7 @@ BINARY     := $(MACOS_DIR)/$(APP)
 SOURCES    := main.m AppDelegate.m BreakOverlayController.m
 CC         := clang
 CFLAGS     := -fobjc-arc -Wall -Wextra -O2 -mmacosx-version-min=13.0
-FRAMEWORKS := -framework Cocoa -framework CoreGraphics -framework ServiceManagement -framework CoreMediaIO
+FRAMEWORKS := -framework Cocoa -framework CoreGraphics -framework ServiceManagement -framework CoreMediaIO -framework IOKit
 
 .PHONY: all run clean
 

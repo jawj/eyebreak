@@ -2,6 +2,7 @@
 #import "BreakOverlayController.h"
 #import <CoreGraphics/CoreGraphics.h>
 #import <CoreMediaIO/CMIOHardware.h>
+#import <IOKit/pwr_mgt/IOPMLib.h>
 #import <ServiceManagement/ServiceManagement.h>
 #import <math.h>
 #import <time.h>
@@ -10,11 +11,12 @@
 static const NSInteger kWorkInterval       = 20 * 60; // 20 minutes of work
 static const NSInteger kBreakDuration      = 20;      // 20 second break
 static const NSInteger kIdleResetThreshold = 3 * 60;  // reset if idle >= 3 minutes
-static const NSInteger kPostCallGrace      = 2 * 60;  // wait this long after a call before breaking
+static const NSInteger kPostCallGrace      = 30;      // wait this long after a call before breaking
 static NSString *const kBreakSoundName      = @"Blow"; // gentle chime when a break starts
 static NSString *const kBreakEndSoundName   = @"Submarine";  // gentle chime when a break completes
 static NSString *const kSilentDefaultsKey   = @"Silent"; // NSUserDefaults: suppress all sounds
 static NSString *const kPostponeDefaultsKey = @"PostponeForWebcam"; // NSUserDefaults: defer breaks during calls
+static NSString *const kPresentingDefaultsKey = @"StopForPresentations"; // NSUserDefaults: no breaks during slideshows
 
 // YES if any camera is currently capturing in any process. We only read the
 // system-wide "is running somewhere" flag CoreMediaIO already maintains, so this
@@ -57,6 +59,43 @@ static BOOL EBCameraInUse(void) {
     return inUse;
 }
 
+// YES if Keynote or PowerPoint is playing a slideshow. Both hold a "keep the
+// display awake" power assertion while presenting (but not while editing), and
+// assertions are public system state, so this needs no Automation or Screen
+// Recording permission and works whether you're mirroring, using presenter view,
+// or rehearsing on the laptop alone.
+static BOOL EBPresenting(void) {
+    static NSArray<NSString *> *bundleIDs;
+    if (!bundleIDs) bundleIDs = @[@"com.apple.iWork.Keynote", @"com.microsoft.Powerpoint"];
+
+    NSMutableSet<NSNumber *> *pids = NSMutableSet.new;
+    for (NSString *bundleID in bundleIDs) {
+        for (NSRunningApplication *app in [NSRunningApplication runningApplicationsWithBundleIdentifier:bundleID]) {
+            [pids addObject:@(app.processIdentifier)];
+        }
+    }
+    if (pids.count == 0) return NO; // cheap early-out for the common case
+
+    CFDictionaryRef byPID = NULL;
+    if (IOPMCopyAssertionsByProcess(&byPID) != kIOReturnSuccess || !byPID) return NO;
+
+    BOOL presenting = NO;
+    NSDictionary<NSNumber *, NSArray<NSDictionary *> *> *assertions = (__bridge NSDictionary *)byPID;
+    for (NSNumber *pid in pids) {
+        for (NSDictionary *assertion in assertions[pid]) {
+            NSString *type = assertion[(__bridge NSString *)kIOPMAssertionTypeKey];
+            if ([type isEqualToString:(__bridge NSString *)kIOPMAssertionTypePreventUserIdleDisplaySleep] ||
+                [type isEqualToString:(__bridge NSString *)kIOPMAssertionTypeNoDisplaySleep]) {
+                presenting = YES;
+                break;
+            }
+        }
+        if (presenting) break;
+    }
+    CFRelease(byPID);
+    return presenting;
+}
+
 // Monotonic clock that does NOT advance while the machine is asleep — the work
 // interval should only count real on-screen time, not time with the lid shut.
 // The 1s timer is just a UI refresh; accuracy comes from comparing against this.
@@ -69,7 +108,7 @@ typedef NS_ENUM(NSInteger, EBState) {
     EBStateOnBreak,
 };
 
-@interface AppDelegate () <NSMenuDelegate>
+@interface AppDelegate () <NSMenuDelegate, NSMenuItemValidation>
 @property (nonatomic, strong) NSStatusItem *statusItem;
 @property (nonatomic, strong) NSTimer *timer;
 @property (nonatomic, strong) BreakOverlayController *overlay;
@@ -77,15 +116,18 @@ typedef NS_ENUM(NSInteger, EBState) {
 @property (nonatomic, assign) uint64_t workDeadline;      // EBNowNanos() of next break
 @property (nonatomic, assign) uint64_t pauseStartedAt;    // EBNowNanos() when paused
 @property (nonatomic, assign) uint64_t cameraFreeSince;   // EBNowNanos() a call last ended (0 = none/on call)
+@property (nonatomic, assign) uint64_t presentingSince;   // EBNowNanos() a slideshow started (0 = not presenting)
 @property (nonatomic, assign) EBState state;
 @property (nonatomic, assign) BOOL paused;
 @property (nonatomic, assign) BOOL silent;
 @property (nonatomic, assign) BOOL postponeForWebcam;
+@property (nonatomic, assign) BOOL stopForPresentations;
 @property (nonatomic, assign) BOOL cameraWasInUse;        // previous tick's camera state
 @property (nonatomic, strong) NSMenuItem *countdownItem;
 @property (nonatomic, strong) NSMenuItem *pauseItem;
 @property (nonatomic, strong) NSMenuItem *silentItem;
 @property (nonatomic, strong) NSMenuItem *postponeItem;
+@property (nonatomic, strong) NSMenuItem *presentingItem;
 @property (nonatomic, strong) NSMenuItem *launchAtLoginItem;
 @end
 
@@ -157,6 +199,13 @@ typedef NS_ENUM(NSInteger, EBState) {
     self.postponeForWebcam = [NSUserDefaults.standardUserDefaults boolForKey:kPostponeDefaultsKey];
     self.postponeItem.state = self.postponeForWebcam ? NSControlStateValueOn : NSControlStateValueOff;
 
+    self.presentingItem = [menu addItemWithTitle:@"Stop for presentations"
+                                          action:@selector(togglePresenting:)
+                                   keyEquivalent:@""];
+    self.presentingItem.target = self;
+    self.stopForPresentations = [NSUserDefaults.standardUserDefaults boolForKey:kPresentingDefaultsKey];
+    self.presentingItem.state = self.stopForPresentations ? NSControlStateValueOn : NSControlStateValueOff;
+
     self.launchAtLoginItem = [menu addItemWithTitle:@"Launch at login"
                                              action:@selector(toggleLaunchAtLogin:)
                                       keyEquivalent:@""];
@@ -195,6 +244,7 @@ typedef NS_ENUM(NSInteger, EBState) {
 - (NSString *)countdownText {
     if (self.paused) return @"Paused";
     if (self.state == EBStateOnBreak) return @"Looking away";
+    if ([self presentationHoldsTimer]) return @"Presenting";
     NSInteger total = [self workSecondsRemaining];
     NSString *sign = total < 0 ? @"-" : @"";
     NSInteger mag = labs(total);
@@ -210,11 +260,36 @@ typedef NS_ENUM(NSInteger, EBState) {
     [self refreshCountdownItem];
 }
 
+// Checked each time the menu opens. A manual break makes no sense mid-call (you
+// can't look away) or mid-talk (you already are), so grey it out then.
+- (BOOL)validateMenuItem:(NSMenuItem *)item {
+    if (item.action == @selector(takeBreakNow:)) {
+        return !(self.postponeForWebcam && EBCameraInUse()) &&
+               !(self.stopForPresentations && EBPresenting());
+    }
+    return YES;
+}
+
 #pragma mark - Timer loop
 
 - (void)tick {
     [self refreshCountdownItem]; // keep the header live while the menu is open
     if (self.paused) return;
+
+    // Presenting is the opposite of a call: you're mostly looking at the
+    // audience, not the screen. So never break mid-talk — and once a slideshow
+    // has run for longer than a break, count that as rest: pin the timer at a
+    // fresh 20 minutes until it ends (much like the idle reset below).
+    if (self.stopForPresentations && EBPresenting()) {
+        if (self.presentingSince == 0) self.presentingSince = EBNowNanos();
+        if (self.state == EBStateOnBreak) {
+            [self endBreak]; // never leave the overlay on top of the slides
+        } else if ([self presentationHoldsTimer]) {
+            [self beginWorkInterval];
+        }
+        return;
+    }
+    self.presentingSince = 0;
 
     if (self.state == EBStateWorking) {
         // Track the camera so we can hold breaks during (and just after) calls.
@@ -278,6 +353,12 @@ typedef NS_ENUM(NSInteger, EBState) {
 }
 
 #pragma mark - Break lifecycle
+
+// YES once a slideshow has been on-screen for longer than a break.
+- (BOOL)presentationHoldsTimer {
+    return self.presentingSince != 0 &&
+           EBNowNanos() - self.presentingSince >= (uint64_t)kBreakDuration * NSEC_PER_SEC;
+}
 
 - (void)playSound:(NSString *)name {
     if (self.silent) return;
@@ -345,6 +426,13 @@ typedef NS_ENUM(NSInteger, EBState) {
         self.cameraWasInUse = NO;
         self.cameraFreeSince = 0;
     }
+}
+
+- (void)togglePresenting:(id)sender {
+    self.stopForPresentations = !self.stopForPresentations;
+    [NSUserDefaults.standardUserDefaults setBool:self.stopForPresentations forKey:kPresentingDefaultsKey];
+    self.presentingItem.state = self.stopForPresentations ? NSControlStateValueOn : NSControlStateValueOff;
+    if (!self.stopForPresentations) self.presentingSince = 0;
 }
 
 - (void)toggleLaunchAtLogin:(id)sender {

@@ -12,11 +12,15 @@ eyes.
 - A gentle chime starts and ends the break (unless toggled to silent)
 - The break only counts down while you're off the keyboard and mouse: any input
   restarts it
-- If you're idle for 5+ minutes, the interval resets: you get a fresh 20 
+- If you're idle for 3+ minutes, the interval resets: you get a fresh 20
   minutes when you return
-- 'Postpone for webcam' option: while your webcam is in use (e.g. you're on a 
-  video call), no breaks are prompted. The break appears two minutes after the
-  call ends.
+- 'Postpone for webcam' option: while your webcam is in use (e.g. you're on a
+  video call), no breaks are prompted. If one fell due during the call, it
+  appears 30 seconds after the call ends.
+- 'Stop for presentations' option: while Keynote or PowerPoint is playing a
+  slideshow, no breaks are prompted. You're mostly looking at the audience
+  rather than the screen, so once a slideshow has run for more than 20 seconds
+  the timer is held at a fresh 20 minutes until it ends.
 
 ## Requirements
 
